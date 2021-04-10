@@ -1,0 +1,170 @@
+#!/bin/zsh
+
+# unvagrant is not vagrant
+
+
+set -e
+
+init_config() {
+  if ! [[ -f UnVagrantfile ]]; then
+    cat << 'EOF' > UnVagrantfile
+# Directory where VMware Fusion virtual machines are located
+# VM_DIRECTORY="$HOME/Virtual Machines.localized"
+
+# Source VMware Fusion virtual machine image
+# VM_IMAGE="my_image"
+# Virtual machine name (in VMware Fusion)
+# VM_NAME="localhost.localdomain.local"
+
+# TODO: implement adapter type and network
+# VM_NETWORK_ADAPTER_TYPE=custom
+# VM_HOST_NETWORK=vmnet2
+
+# TODO: implement setting os hostname
+# Hostname for the virtual machine
+# HOSTNAME="test.localdomain.local"
+
+# Credentials to run commands and connect via `ssh` as
+VM_USERNAME=myuser
+VM_PASSWORD=mypass
+EOF
+  else
+    echo "UnVagrantfile already exists... exiting."
+  fi
+}
+
+load_config() {
+  source UnVagrantfile
+  PROJECT_DIR="${PWD}"
+  # generate mix of random characters/numbers in case certain variables are unset
+  RAND=$(cat /dev/urandom | base64 | tr -dc 'a-z0-9' | fold -w 8 | head -n 1)
+  VM_DIR="${VM_DIRECTORY:=$HOME/Virtual Machines.localized}"
+  VM_IMAGE="${VM_IMAGE:?undefined}"
+  VM_NAME="${VM_NAME:=$VM_IMAGE-$RAND}"
+  VM_NAME_PATH="${VM_DIR}/${VM_NAME}.vmwarevm/${VM_NAME}.vmx"
+  # TODO: implement setting os hostname
+  # HOSTNAME="${HOSTNAME:=$VM_IMAGE-$RAND.localdomain.local}"
+  VM_USERNAME="${VM_USERNAME}"
+  VM_PASSWORD="${VM_PASSWORD}"
+}
+
+check_vm() {
+  if ! [[ -f "${1}" ]]; then
+    echo "VM not found: ${1}"
+    exit 1
+  fi
+}
+
+create_vm() {
+  if ! [[ -f "${1}" ]]; then
+    echo "VM image not found: ${1}"
+    exit 1
+  fi
+
+  if [[ -f "${2}" ]]; then
+    echo "VM already exists: ${2}"
+    exit 1
+  fi
+
+  vmrun clone "${1}" "${2}" full -cloneName="${3}"
+  # TODO: Implement network adapter type and host network arguments
+  vmrun addNetworkAdapter "${2}" custom vmnet2
+}
+
+start_vm() {
+  vmrun start "${1}" "${2}"
+
+  echo "Waiting for machine to become available..."
+  while ! vmrun checkToolsState "${1}" >/dev/null 2>&1; do
+    sleep 5
+  done
+}
+
+case "$1" in
+  init)
+    init_config
+    ;;
+
+  deploy)
+    load_config
+    VM_IMAGE_PATH="${VM_DIR}/${VM_IMAGE}.vmwarevm/${VM_IMAGE}.vmx"
+
+    create_vm "${VM_IMAGE_PATH}" "${VM_NAME_PATH}" "${VM_NAME}"
+    # TODO: Implement gui|nogui virtual machine start argument
+    start_vm "${VM_NAME_PATH}" gui
+
+    if [[ $(vmrun readVariable "${VM_NAME_PATH}" runtimeConfig guestOS) =~ '^debian' ]]; then
+      vmrun writeVariable "${VM_NAME_PATH}" guestVar sudo_pass "${VM_PASSWORD}"
+      vmrun -gu "${VM_USERNAME}" -gp "${VM_PASSWORD}" runScriptInGuest \
+        "${VM_NAME_PATH}" \
+        '/usr/bin/bash' \
+        '/usr/bin/echo $(/usr/bin/vmware-rpctool "info-get guestinfo.sudo_pass") | /usr/bin/sudo -S /usr/bin/apt update -y;'
+      vmrun -gu "${VM_USERNAME}" -gp "${VM_PASSWORD}" runScriptInGuest \
+        "${VM_NAME_PATH}" \
+        '/usr/bin/bash' \
+        '/usr/bin/echo $(/usr/bin/vmware-rpctool "info-get guestinfo.sudo_pass") | /usr/bin/sudo -S /usr/bin/apt install -y openssh-server;'
+    fi
+
+    if ! [[ -d "${PROJECT_DIR}/.ssh" ]]; then
+      mkdir "${PROJECT_DIR}/.ssh"
+      ssh-keygen -N '' -f "${PROJECT_DIR}/.ssh/id_rsa"
+      vmrun -gu "${VM_USERNAME}" -gp "${VM_PASSWORD}" createDirectoryInGuest \
+        "${VM_NAME_PATH}" \
+        "/home/${VM_USERNAME}/.ssh"
+      vmrun -gu "${VM_USERNAME}" -gp "${VM_PASSWORD}" CopyFileFromHostToGuest \
+        "${VM_NAME_PATH}" \
+        "${PROJECT_DIR}/.ssh/id_rsa.pub" \
+        "/home/${VM_USERNAME}/.ssh/authorized_keys"
+    fi
+
+    vmrun writeVariable "${VM_NAME_PATH}" guestVar project_folder $(basename $PROJECT_DIR)
+    vmrun enableSharedFolders "${VM_NAME_PATH}" runtime
+    vmrun addSharedFolder "${VM_NAME_PATH}" $(basename $PROJECT_DIR) $PROJECT_DIR
+    vmrun -gu "${VM_USERNAME}" -gp "${VM_PASSWORD}" runProgramInGuest \
+      "${VM_NAME_PATH}" \
+      '/usr/bin/ln' '-s' \
+      '/mnt/hgfs/$(vmware-rpctool "info-get guestinfo.project_folder")' \
+      '${HOME}/$(vmware-rpctool "info-get guestinfo.project_folder")'
+    # TODO: Configure ip address/netmask, gateway, dns and hostname
+    # TODO: Implement post-deploy OS configuration management
+    ;;
+
+  destroy)
+    load_config
+    check_vm "${VM_NAME_PATH}"
+    vmrun deleteVM "${VM_NAME_PATH}"
+    ;;
+
+  ssh)
+    load_config
+    check_vm "${VM_NAME_PATH}"
+
+    while ! vmrun getGuestIPAddress "${VM_NAME_PATH}" >/dev/null 2>&1; do
+      sleep 5
+    done
+
+    IP=$(vmrun getGuestIPAddress "${VM_NAME_PATH}")
+    ssh -i "${PROJECT_DIR}/.ssh/id_rsa" \
+      -o "UserKnownHostsFile=${PROJECT_DIR}/.ssh/known_hosts" \
+      "${VM_USERNAME}@${IP}"
+    ;;
+
+  start)
+    load_config
+    check_vm "${VM_NAME_PATH}"
+    # TODO: Implement gui|nogui virtual machine start argument
+    start_vm "${VM_NAME_PATH}" gui
+    vmrun enableSharedFolders "${VM_NAME_PATH}" runtime
+    ;;
+
+  stop)
+    load_config
+    check_vm "${VM_NAME_PATH}"
+    # TODO: Implement hard|soft virtual machine stop argument
+    vmrun stop "${VM_NAME_PATH}" soft
+    ;;
+
+  *)
+    echo "Usage: $0 {init|deploy|destroy|ssh|start|stop}"
+    ;;
+esac
